@@ -1,12 +1,11 @@
 """
 ETH Price Alert - Configuration
-从环境变量或 .env 文件加载配置，敏感信息不写入代码
+敏感信息通过环境变量或 .env 文件配置
 """
 
 import os
 from pathlib import Path
 
-# 加载 .env 文件（如果存在）
 try:
     from dotenv import load_dotenv
     env_path = Path(__file__).parent / ".env"
@@ -16,7 +15,7 @@ except ImportError:
     pass
 
 # ──────────────────────────────────────────────
-# CoinGlass API（备选数据源）
+# 数据源
 # ──────────────────────────────────────────────
 COINGLASS_API_KEY = os.environ.get("COINGLASS_API_KEY", "")
 
@@ -24,9 +23,18 @@ COINGLASS_API_KEY = os.environ.get("COINGLASS_API_KEY", "")
 # 监控参数
 # ──────────────────────────────────────────────
 SYMBOL = "ETH"
-THRESHOLD_PERCENT = float(os.environ.get("THRESHOLD_PERCENT", "1.0"))
-CHECK_INTERVAL_SECONDS = int(os.environ.get("CHECK_INTERVAL", "60"))
-SLIDING_WINDOW_MINUTES = int(os.environ.get("WINDOW_MINUTES", "10"))
+
+# 窗口1：5 分钟内波动 ≥ $10
+WINDOW_1_MINUTES = int(os.environ.get("WINDOW_1_MINUTES", "5"))
+WINDOW_1_THRESHOLD = float(os.environ.get("WINDOW_1_THRESHOLD", "10"))  # 美元
+
+# 窗口2：10 分钟内波动 ≥ $20
+WINDOW_2_MINUTES = int(os.environ.get("WINDOW_2_MINUTES", "10"))
+WINDOW_2_THRESHOLD = float(os.environ.get("WINDOW_2_THRESHOLD", "20"))  # 美元
+
+# 冷却时间（分钟）
+COOLDOWN_1_MINUTES = int(os.environ.get("COOLDOWN_1_MINUTES", "15"))
+COOLDOWN_2_MINUTES = int(os.environ.get("COOLDOWN_2_MINUTES", "30"))
 
 # ──────────────────────────────────────────────
 # 邮件配置

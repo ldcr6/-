@@ -1,8 +1,8 @@
 <div align="center">
 
-# 📈 ETH Price Alert Monitor
+# 📈 ETH Price Alert Monitor v2
 
-**基于滑动窗口算法的 ETH 价格波动实时监控与邮件告警系统**
+**基于双滑动窗口算法的 ETH 价格波动实时监控与邮件告警系统**
 
 ![Python](https://img.shields.io/badge/Python-3.8+-blue.svg)
 ![License](https://img.shields.io/badge/license-MIT-green.svg)
@@ -14,34 +14,110 @@
 
 ## 📖 项目简介
 
-一个轻量级的 ETH/USDT 价格监控工具，通过滑动窗口算法实时检测价格波动，当波动幅度超过预设阈值时自动发送邮件告警。适用于加密货币交易者、量化分析师和区块链开发者。
+轻量级 ETH/USDT 价格监控工具。每分钟整秒对齐采样，通过双滑动窗口（5 分钟 / 10 分钟）检测价格波动，超过绝对金额阈值时自动发送邮件告警。
 
 ## ✨ 核心特性
 
-- **滑动窗口算法** — 精确计算指定时间窗口内的价格变化幅度
-- **多数据源支持** — Gate.io（主）/ CoinGlass（备），自动故障转移
-- **智能告警冷却** — 同一方向 30 分钟内不重复告警，避免信息轰炸
-- **邮件通知** — 支持 163/QQ/Gmail 等主流邮箱 SMTP 发送
-- **纯 Python 实现** — 无复杂依赖，单文件可运行
+- **整分对齐** — 启动后等到下一个整分 0 秒开始，之后每分钟 0 秒精确采样
+- **双窗口检测** — 5 分钟 ≥ $10 和 10 分钟 ≥ $20 两个独立窗口同时监控
+- **绝对金额告警** — 以美元为单位，直观易懂
+- **独立冷却** — 每个窗口独立冷却，避免重复告警
+- **免费数据源** — Gate.io API，无需 API Key，国内可访问
 
-## 🏗️ 架构设计
+## 🏗️ 工作原理
 
 ```
-┌─────────────────────────────────────────────────┐
-│                  主监控循环                       │
-│         每 N 秒获取一次最新价格                    │
-├─────────────────────────────────────────────────┤
-│              多源价格获取层                       │
-│    Gate.io (主)  ←→  CoinGlass (备)              │
-├─────────────────────────────────────────────────┤
-│              滑动窗口引擎                        │
-│   deque 维护最近 M 分钟价格数据                   │
-│   计算窗口内 (最新-最旧)/最旧 × 100%              │
-├─────────────────────────────────────────────────┤
-│              告警决策层                          │
-│   |变化%| ≥ 阈值 → 冷却检查 → 邮件发送           │
-└─────────────────────────────────────────────────┘
+启动 → 等待到整分 0 秒
+       ↓
+每 60 秒循环：
+  获取 ETH/USDT 最新价格
+       ↓
+  存入 5 分钟窗口 + 10 分钟窗口
+       ↓
+  检查 5 分钟窗口：|变化| ≥ $10 且冷却结束 → 发邮件
+       ↓
+  检查 10 分钟窗口：|变化| ≥ $20 且冷却结束 → 发邮件
+       ↓
+  输出状态日志
+       ↓
+  等待下一个整分 0 秒
 ```
+
+### 告警示例
+
+```
+22:24:00 ETH: $2,300 | 5min:+$3.00 | 10min:+$5.00
+22:25:00 ETH: $2,305 | 5min:+$8.00 | 10min:+$12.00
+22:26:00 ETH: $2,308 | 5min:+$11.00 | 10min:+$15.00
+                               ↓
+              🚨 5 分钟窗口触发！$11 ≥ $10 → 发邮件
+                               ↓
+                    冷却 15 分钟（5min 窗口）
+```
+
+## 🚀 快速开始
+
+### 1. 安装依赖
+
+```bash
+pip install -r requirements.txt
+```
+
+### 2. 配置
+
+复制 `.env.example` 为 `.env`：
+
+```bash
+cp .env.example .env
+```
+
+编辑 `.env`，填入邮箱配置：
+
+```env
+SENDER_EMAIL=your_email@163.com
+SENDER_PASSWORD=your_smtp_authorization_code
+RECEIVER_EMAIL=your_email@163.com
+```
+
+### 3. 运行
+
+```bash
+python monitor.py
+```
+
+输出示例：
+
+```
+============================================================
+  ETH 价格波动监控 v2
+  数据源: Gate.io
+  币种: ETH
+  窗口1: 5 分钟 / ±$10
+  窗口2: 10 分钟 / ±$20
+============================================================
+
+[22:24:00] #1 ETH: $2,313.82 | 5min:-- | 10min:--
+[22:25:00] #2 ETH: $2,315.50 | 5min:+$1.68 | 10min:+$1.68
+[22:26:00] #3 ETH: $2,320.00 | 5min:+$6.18 | 10min:+$6.18
+```
+
+## ⚙️ 配置参数
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `WINDOW_1_MINUTES` | `5` | 窗口1时长（分钟） |
+| `WINDOW_1_THRESHOLD` | `10` | 窗口1触发金额（美元） |
+| `WINDOW_2_MINUTES` | `10` | 窗口2时长（分钟） |
+| `WINDOW_2_THRESHOLD` | `20` | 窗口2触发金额（美元） |
+| `COOLDOWN_1_MINUTES` | `15` | 窗口1冷却时间（分钟） |
+| `COOLDOWN_2_MINUTES` | `30` | 窗口2冷却时间（分钟） |
+| `SMTP_HOST` | `smtp.163.com` | SMTP 服务器 |
+| `SMTP_PORT` | `465` | SMTP 端口 |
+
+### SMTP 授权码获取
+
+- **163 邮箱**：设置 → POP3/SMTP/IMAP → 开启 SMTP → 获取授权码
+- **QQ 邮箱**：设置 → 账户 → POP3/SMTP → 开启 → 获取授权码
 
 ## 📁 项目结构
 
@@ -52,103 +128,13 @@ eth-price-alert/
 ├── .env.example        # 环境变量模板
 ├── requirements.txt    # Python 依赖
 ├── .gitignore          # Git 忽略规则
+├── LICENSE             # MIT 许可证
 └── README.md           # 项目文档
-```
-
-## 🚀 快速开始
-
-### 1. 克隆项目
-
-```bash
-git clone https://github.com/ldcr6/eth-price-alert.git
-cd eth-price-alert
-```
-
-### 2. 安装依赖
-
-```bash
-pip install -r requirements.txt
-```
-
-### 3. 配置环境变量
-
-复制 `.env.example` 为 `.env` 并填入你的配置：
-
-```bash
-cp .env.example .env
-```
-
-编辑 `.env` 文件：
-
-```env
-# 邮件配置（必须）
-SENDER_EMAIL=your_email@163.com
-SENDER_PASSWORD=your_smtp_authorization_code
-RECEIVER_EMAIL=your_email@163.com
-
-# 监控参数（可选）
-THRESHOLD_PERCENT=1.0    # 波动阈值（%）
-CHECK_INTERVAL=60        # 检查间隔（秒）
-WINDOW_MINUTES=10        # 滑动窗口（分钟）
-```
-
-### 4. 运行
-
-```bash
-python monitor.py
-```
-
-## ⚙️ 配置说明
-
-| 参数 | 默认值 | 说明 |
-|------|--------|------|
-| `THRESHOLD_PERCENT` | `1.0` | 价格波动触发阈值（%） |
-| `CHECK_INTERVAL` | `60` | 每次检查间隔（秒） |
-| `WINDOW_MINUTES` | `10` | 滑动窗口时长（分钟） |
-| `SMTP_HOST` | `smtp.163.com` | SMTP 服务器地址 |
-| `SMTP_PORT` | `465` | SMTP 端口（SSL） |
-| `EMAIL_ENABLED` | `true` | 是否启用邮件告警 |
-
-### SMTP 授权码获取
-
-- **163 邮箱**：设置 → POP3/SMTP/IMAP → 开启 SMTP → 获取授权码
-- **QQ 邮箱**：设置 → 账户 → POP3/SMTP → 开启 → 获取授权码
-
-## 📊 工作原理
-
-### 滑动窗口算法
-
-```python
-# 价格数据以 (时间, 价格) 元组存储在 deque 中
-prices = deque([
-    (10:00, 2300.00),
-    (10:01, 2305.50),
-    (10:02, 2310.00),
-    ...
-])
-
-# 计算窗口内变化百分比
-change = (newest - oldest) / oldest × 100%
-# 例: (2310 - 2300) / 2300 × 100% = +0.43%
-```
-
-### 告警冷却机制
-
-```
-10:00  价格 +1.2% → 触发告警 ✅ → 冷却开始（30min）
-10:05  价格 +1.5% → 冷却中，跳过 ⏸️
-10:10  价格 +2.0% → 冷却中，跳过 ⏸️
-10:31  价格 +1.3% → 冷却结束，触发告警 ✅
 ```
 
 ## 📄 License
 
 [MIT](LICENSE)
-
-## 🙏 致谢
-
-- [Gate.io API](https://www.gateio.pro/docs/developers/apiv4/) — 免费实时行情数据
-- [CoinGlass API](https://docs.coinglass.com/) — 加密货币衍生品数据
 
 ---
 

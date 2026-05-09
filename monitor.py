@@ -1,13 +1,17 @@
 """
-ETH 价格波动监控脚本
-- 每分钟从 Gate.io 获取 ETH 最新价格
-- 维护 10 分钟滑动窗口
-- 价格波动超过 1% 时发送邮件提醒
-- 冷却机制：同一方向 30 分钟内不重复告警
+ETH 价格波动监控脚本 v2
+
+功能：
+  - 每分钟 0 秒对齐检查（整分整秒）
+  - 双滑动窗口：5 分钟 / 10 分钟
+  - 5 分钟波动 ≥ $10 → 邮件告警
+  - 10 分钟波动 ≥ $20 → 邮件告警
+  - 每个窗口独立冷却（15min / 30min）
+
+数据源：Gate.io（免费，国内可访问）
 """
 
 import time
-import json
 import smtplib
 import ssl
 from datetime import datetime, timedelta
@@ -19,12 +23,14 @@ from typing import Optional
 try:
     import requests
 except ImportError:
-    print("请先安装 requests: pip install requests")
+    print("请先安装依赖: pip install requests python-dotenv")
     exit(1)
 
 from config import (
-    COINGLASS_API_KEY, SYMBOL, THRESHOLD_PERCENT,
-    CHECK_INTERVAL_SECONDS, SLIDING_WINDOW_MINUTES,
+    SYMBOL,
+    WINDOW_1_MINUTES, WINDOW_1_THRESHOLD,
+    WINDOW_2_MINUTES, WINDOW_2_THRESHOLD,
+    COOLDOWN_1_MINUTES, COOLDOWN_2_MINUTES,
     EMAIL_ENABLED, SMTP_HOST, SMTP_PORT, SMTP_USE_SSL,
     SENDER_EMAIL, SENDER_PASSWORD, RECEIVER_EMAIL
 )
@@ -34,50 +40,16 @@ from config import (
 # 数据源
 # ──────────────────────────────────────────────
 
-def fetch_from_gateio() -> Optional[float]:
+def fetch_eth_price() -> Optional[float]:
     """从 Gate.io 获取 ETH/USDT 最新价格"""
     try:
         url = "https://api.gateio.ws/api/v4/spot/tickers"
-        params = {"currency_pair": "ETH_USDT"}
-        resp = requests.get(url, params=params, timeout=10)
+        resp = requests.get(url, params={"currency_pair": "ETH_USDT"}, timeout=10)
         data = resp.json()
         if isinstance(data, list) and len(data) > 0:
             return float(data[0]["last"])
     except Exception as e:
-        print(f"[Gate.io] 失败: {e}")
-    return None
-
-
-def fetch_from_coinglass() -> Optional[float]:
-    """从 CoinGlass 获取 ETH 价格（需要付费计划）"""
-    try:
-        url = "https://open-api-v4.coinglass.com/api/futures/coins-price-change"
-        headers = {
-            "CG-API-KEY": COINGLASS_API_KEY,
-            "Accept": "application/json"
-        }
-        resp = requests.get(url, headers=headers, timeout=10)
-        data = resp.json()
-        if data.get("code") == "0" and data.get("data"):
-            for coin in data["data"]:
-                if coin.get("symbol") == "ETH":
-                    return float(coin.get("currentPrice", 0))
-    except Exception as e:
-        print(f"[CoinGlass] 失败: {e}")
-    return None
-
-
-def fetch_eth_price() -> Optional[float]:
-    """获取 ETH 当前价格（多源）"""
-    price = fetch_from_gateio()
-    if price is not None:
-        return price
-    
-    price = fetch_from_coinglass()
-    if price is not None:
-        return price
-    
-    print("[警告] 所有数据源均获取失败")
+        print(f"[错误] 获取价格失败: {e}")
     return None
 
 
@@ -102,20 +74,8 @@ class PriceWindow:
         while self.prices and self.prices[0][0] < cutoff:
             self.prices.popleft()
 
-    def get_extremes(self) -> Optional[dict]:
-        if len(self.prices) < 2:
-            return None
-        self._cleanup()
-        prices_only = [p[1] for p in self.prices]
-        return {
-            "min": min(prices_only),
-            "max": max(prices_only),
-            "current": prices_only[-1],
-            "oldest": prices_only[0],
-            "count": len(prices_only)
-        }
-
-    def calc_change_percent(self) -> Optional[float]:
+    def calc_change(self) -> Optional[float]:
+        """计算窗口内价格变化（绝对金额，美元）"""
         if len(self.prices) < 2:
             return None
         self._cleanup()
@@ -123,9 +83,21 @@ class PriceWindow:
             return None
         oldest = self.prices[0][1]
         newest = self.prices[-1][1]
-        if oldest == 0:
+        return newest - oldest
+
+    def get_info(self) -> Optional[dict]:
+        """返回窗口统计信息"""
+        if len(self.prices) < 2:
             return None
-        return ((newest - oldest) / oldest) * 100
+        self._cleanup()
+        prices_only = [p[1] for p in self.prices]
+        return {
+            "oldest": prices_only[0],
+            "newest": prices_only[-1],
+            "min": min(prices_only),
+            "max": max(prices_only),
+            "count": len(prices_only)
+        }
 
 
 # ──────────────────────────────────────────────
@@ -133,19 +105,16 @@ class PriceWindow:
 # ──────────────────────────────────────────────
 
 class AlertCooldown:
-    def __init__(self, cooldown_minutes: int = 30):
-        self.cooldown = timedelta(minutes=cooldown_minutes)
-        self.last_alert: dict = {}
+    def __init__(self):
+        self.last_alert: Optional[datetime] = None
 
-    def should_alert(self, direction: str) -> bool:
-        now = datetime.now()
-        last = self.last_alert.get(direction)
-        if last and (now - last) < self.cooldown:
-            return False
-        return True
+    def should_alert(self, cooldown_minutes: int) -> bool:
+        if self.last_alert is None:
+            return True
+        return (datetime.now() - self.last_alert) >= timedelta(minutes=cooldown_minutes)
 
-    def record_alert(self, direction: str):
-        self.last_alert[direction] = datetime.now()
+    def record_alert(self):
+        self.last_alert = datetime.now()
 
 
 # ──────────────────────────────────────────────
@@ -170,8 +139,7 @@ def send_email(subject: str, body: str) -> bool:
                 <pre style="font-size:14px;line-height:1.6;">{body}</pre>
             </div>
             <p style="color:#888;font-size:12px;">
-                时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}<br>
-                来源: ETH 价格监控脚本
+                时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
             </p>
         </body>
         </html>
@@ -197,21 +165,34 @@ def send_email(subject: str, body: str) -> bool:
 
 
 # ──────────────────────────────────────────────
-# 告警格式
+# 时间对齐
 # ──────────────────────────────────────────────
 
-def format_alert(change_pct: float, extremes: dict) -> str:
-    direction = "📈 上涨" if change_pct > 0 else "📉 下跌"
-    return f"""ETH 价格在过去 {SLIDING_WINDOW_MINUTES} 分钟内 {direction} {abs(change_pct):.2f}%
+def wait_until_next_minute():
+    """等待到下一个整分 0 秒"""
+    now = datetime.now()
+    seconds_left = 60 - now.second
+    if seconds_left == 60:
+        return  # 已经是 0 秒
+    print(f"[{now.strftime('%H:%M:%S')}] 等待 {seconds_left} 秒到下一个整分...")
+    time.sleep(seconds_left)
 
-当前价格: ${extremes['current']:,.2f}
-窗口起始: ${extremes['oldest']:,.2f}
-窗口最高: ${extremes['max']:,.2f}
-窗口最低: ${extremes['min']:,.2f}
-数据点数: {extremes['count']} 个
 
-阈值: ±{THRESHOLD_PERCENT}%
-方向: {direction}"""
+# ──────────────────────────────────────────────
+# 告警内容
+# ──────────────────────────────────────────────
+
+def format_alert(window_name: str, threshold: float, change: float, info: dict) -> str:
+    direction = "📈 上涨" if change > 0 else "📉 下跌"
+    return f"""{window_name} 触发告警
+
+{direction} ${abs(change):.2f}（阈值 ±${threshold:.0f}）
+
+当前价格: ${info['newest']:,.2f}
+窗口起始: ${info['oldest']:,.2f}
+窗口最高: ${info['max']:,.2f}
+窗口最低: ${info['min']:,.2f}
+数据点数: {info['count']} 个"""
 
 
 # ──────────────────────────────────────────────
@@ -220,56 +201,76 @@ def format_alert(change_pct: float, extremes: dict) -> str:
 
 def main():
     print("=" * 60)
-    print("  ETH 价格波动监控")
-    print(f"  数据源: Gate.io (主) / CoinGlass (备)")
+    print("  ETH 价格波动监控 v2")
+    print(f"  数据源: Gate.io")
     print(f"  币种: {SYMBOL}")
-    print(f"  阈值: ±{THRESHOLD_PERCENT}%")
-    print(f"  窗口: {SLIDING_WINDOW_MINUTES} 分钟")
-    print(f"  检查间隔: {CHECK_INTERVAL_SECONDS} 秒")
-    print(f"  邮件提醒: {'开启' if EMAIL_ENABLED else '关闭'}")
+    print(f"  窗口1: {WINDOW_1_MINUTES} 分钟 / ±${WINDOW_1_THRESHOLD:.0f}")
+    print(f"  窗口2: {WINDOW_2_MINUTES} 分钟 / ±${WINDOW_2_THRESHOLD:.0f}")
+    print(f"  冷却1: {COOLDOWN_1_MINUTES} 分钟 | 冷却2: {COOLDOWN_2_MINUTES} 分钟")
+    print(f"  邮件: {'开启' if EMAIL_ENABLED else '关闭'}")
     print("=" * 60)
-    print()
 
-    window = PriceWindow(SLIDING_WINDOW_MINUTES)
-    cooldown = AlertCooldown(cooldown_minutes=30)
+    # 初始化
+    window_1 = PriceWindow(WINDOW_1_MINUTES)
+    window_2 = PriceWindow(WINDOW_2_MINUTES)
+    cooldown_1 = AlertCooldown()
+    cooldown_2 = AlertCooldown()
     check_count = 0
     alert_count = 0
 
+    # 时间对齐
+    wait_until_next_minute()
+    print()
+
     while True:
         try:
+            now = datetime.now()
             price = fetch_eth_price()
             check_count += 1
 
             if price is None:
-                print(f"[{datetime.now().strftime('%H:%M:%S')}] 第 {check_count} 次 — 获取失败，跳过")
-                time.sleep(CHECK_INTERVAL_SECONDS)
+                print(f"[{now.strftime('%H:%M:%S')}] 第 {check_count} 次 — 获取失败")
+                time.sleep(60)
                 continue
 
-            window.add(price)
-            extremes = window.get_extremes()
-            change_pct = window.calc_change_percent()
+            # 存入两个窗口
+            window_1.add(price)
+            window_2.add(price)
 
-            status = ""
-            if change_pct is not None:
-                status = f" | 变化: {change_pct:+.3f}%"
+            # 检查窗口1
+            change_1 = window_1.calc_change()
+            alert_1 = ""
+            if change_1 is not None and abs(change_1) >= WINDOW_1_THRESHOLD:
+                if cooldown_1.should_alert(COOLDOWN_1_MINUTES):
+                    info_1 = window_1.get_info()
+                    alert_count += 1
+                    body = format_alert("5 分钟窗口", WINDOW_1_THRESHOLD, change_1, info_1)
+                    subject = f"⚠️ ETH {WINDOW_1_MINUTES}min {'↑' if change_1 > 0 else '↓'}${abs(change_1):.2f} — ${price:,.2f}"
+                    send_email(subject, body)
+                    cooldown_1.record_alert()
+                    alert_1 = f" | 🚨 5min: {change_1:+.2f}$"
+                else:
+                    alert_1 = f" | 5min 冷却中"
 
-                if abs(change_pct) >= THRESHOLD_PERCENT:
-                    direction = "up" if change_pct > 0 else "down"
+            # 检查窗口2
+            change_2 = window_2.calc_change()
+            alert_2 = ""
+            if change_2 is not None and abs(change_2) >= WINDOW_2_THRESHOLD:
+                if cooldown_2.should_alert(COOLDOWN_2_MINUTES):
+                    info_2 = window_2.get_info()
+                    alert_count += 1
+                    body = format_alert("10 分钟窗口", WINDOW_2_THRESHOLD, change_2, info_2)
+                    subject = f"⚠️ ETH {WINDOW_2_MINUTES}min {'↑' if change_2 > 0 else '↓'}${abs(change_2):.2f} — ${price:,.2f}"
+                    send_email(subject, body)
+                    cooldown_2.record_alert()
+                    alert_2 = f" | 🚨 10min: {change_2:+.2f}$"
+                else:
+                    alert_2 = f" | 10min 冷却中"
 
-                    if cooldown.should_alert(direction):
-                        alert_count += 1
-                        print(f"\n{'!'*60}")
-                        print(f"  ⚠️  告警 #{alert_count}: {change_pct:+.2f}%")
-                        print(f"{'!'*60}\n")
-
-                        body = format_alert(change_pct, extremes)
-                        subject = f"⚠️ ETH {'上涨' if change_pct > 0 else '下跌'} {abs(change_pct):.2f}% — ${price:,.2f}"
-                        send_email(subject, body)
-                        cooldown.record_alert(direction)
-                    else:
-                        status += " [冷却中]"
-
-            print(f"[{datetime.now().strftime('%H:%M:%S')}] 第 {check_count} 次 | ETH: ${price:,.2f}{status}")
+            # 状态输出
+            c1 = f"5min:{change_1:+.2f}$" if change_1 else "5min:--"
+            c2 = f"10min:{change_2:+.2f}$" if change_2 else "10min:--"
+            print(f"[{now.strftime('%H:%M:%S')}] #{check_count} ETH: ${price:,.2f} | {c1} | {c2}{alert_1}{alert_2}")
 
         except KeyboardInterrupt:
             print(f"\n监控停止。共 {check_count} 次检查，{alert_count} 次告警。")
@@ -277,7 +278,7 @@ def main():
         except Exception as e:
             print(f"[{datetime.now().strftime('%H:%M:%S')}] 异常: {e}")
 
-        time.sleep(CHECK_INTERVAL_SECONDS)
+        time.sleep(60)
 
 
 if __name__ == "__main__":
